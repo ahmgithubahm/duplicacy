@@ -71,6 +71,10 @@ func getRepositoryPreference(context *cli.Context, storageName string) (reposito
 	}
 
 	if storageName == "" {
+		if duplicacy.Preferences[0].RepositoryPath != "" {
+			repository = duplicacy.Preferences[0].RepositoryPath
+			duplicacy.LOG_INFO("REPOSITORY_SET", "Repository set to %s", repository)
+		}
 		return repository, &duplicacy.Preferences[0]
 	}
 
@@ -80,6 +84,12 @@ func getRepositoryPreference(context *cli.Context, storageName string) (reposito
 		duplicacy.LOG_ERROR("STORAGE_NONE", "No storage named '%s' is found", storageName)
 		return "", nil
 	}
+
+	if preference.RepositoryPath != "" {
+		repository = preference.RepositoryPath
+		duplicacy.LOG_INFO("REPOSITORY_SET", "Repository set to %s", repository)
+	}
+
 	return repository, preference
 }
 
@@ -293,9 +303,14 @@ func configRepository(context *cli.Context, init bool) {
 		}
 	}
 
+	repositoryPath := ""
+	if context.String("repository") != "" {
+		repositoryPath = context.String("repository")
+	}
 	preference := duplicacy.Preference{
 		Name:       storageName,
 		SnapshotID: snapshotID,
+		RepositoryPath: repositoryPath,
 		StorageURL: storageURL,
 		Encrypted:  context.Bool("encrypt"),
 	}
@@ -427,8 +442,12 @@ func configRepository(context *cli.Context, init bool) {
 
 	duplicacy.SavePreferences()
 
+	if repositoryPath == "" {
+		repositoryPath = repository
+	}
+
 	duplicacy.LOG_INFO("REPOSITORY_INIT", "%s will be backed up to %s with id %s",
-		repository, preference.StorageURL, preference.SnapshotID)
+		repositoryPath, preference.StorageURL, preference.SnapshotID)
 }
 
 type TriBool struct {
@@ -695,13 +714,14 @@ func backupRepository(context *cli.Context) {
 
 	dryRun := context.Bool("dry-run")
 	uploadRateLimit := context.Int("limit-rate")
+	enumOnly := context.Bool("enum-only")
 	storage.SetRateLimits(0, uploadRateLimit)
 	backupManager := duplicacy.CreateBackupManager(preference.SnapshotID, storage, repository, password, preference.NobackupFile)
 	duplicacy.SavePassword(*preference, "password", password)
 
 	backupManager.SetupSnapshotCache(preference.Name)
 	backupManager.SetDryRun(dryRun)
-	backupManager.Backup(repository, quickMode, threads, context.String("t"), showStatistics, enableVSS, vssTimeout)
+	backupManager.Backup(repository, quickMode, threads, context.String("t"), showStatistics, enableVSS, vssTimeout, enumOnly)
 
 	runScript(context, preference.Name, "post")
 }
@@ -1046,12 +1066,17 @@ func pruneSnapshots(context *cli.Context) {
 		os.Exit(ArgumentExitCode)
 	}
 
+	threads := context.Int("threads")
+	if threads < 1 {
+		threads = 1
+	}
+
 	repository, preference := getRepositoryPreference(context, "")
 
 	runScript(context, preference.Name, "pre")
 
 	duplicacy.LOG_INFO("STORAGE_SET", "Storage set to %s", preference.StorageURL)
-	storage := duplicacy.CreateStorage(*preference, false, 1)
+	storage := duplicacy.CreateStorage(*preference, false, threads)
 	if storage == nil {
 		return
 	}
@@ -1090,7 +1115,7 @@ func pruneSnapshots(context *cli.Context) {
 
 	backupManager.SetupSnapshotCache(preference.Name)
 	backupManager.SnapshotManager.PruneSnapshots(selfID, snapshotID, revisions, tags, retentions,
-		exhaustive, exclusive, ignoredIDs, dryRun, deleteOnly, collectOnly)
+		exhaustive, exclusive, ignoredIDs, dryRun, deleteOnly, collectOnly, threads)
 
 	runScript(context, preference.Name, "post")
 }
@@ -1242,6 +1267,50 @@ func infoStorage(context *cli.Context) {
 
 }
 
+func benchmark(context *cli.Context) {
+	setGlobalOptions(context)
+	defer duplicacy.CatchLogException()
+
+	fileSize := context.Int("file-size")
+	if fileSize == 0 {
+		fileSize = 256
+	}
+
+	chunkCount := context.Int("chunk-count")
+	if chunkCount == 0 {
+		chunkCount = 64
+	}
+
+	chunkSize := context.Int("chunk-size")
+	if chunkSize == 0 {
+		chunkSize = 4
+	}
+
+	downloadThreads := context.Int("download-threads")
+	if downloadThreads < 1 {
+		downloadThreads = 1
+	}
+
+	uploadThreads := context.Int("upload-threads")
+	if uploadThreads < 1 {
+		uploadThreads = 1
+	}
+
+	threads := downloadThreads
+	if (threads < uploadThreads) {
+		threads = uploadThreads
+	}
+
+	repository, preference := getRepositoryPreference(context, context.String("storage"))
+
+	duplicacy.LOG_INFO("STORAGE_SET", "Storage set to %s", preference.StorageURL)
+	storage := duplicacy.CreateStorage(*preference, false, threads)
+	if storage == nil {
+		return
+	}
+	duplicacy.Benchmark(repository, storage, int64(fileSize) * 1000000, chunkSize * 1024 * 1024, chunkCount, uploadThreads, downloadThreads)
+}
+
 func main() {
 
 	duplicacy.SetLoggingLevel(duplicacy.INFO)
@@ -1287,6 +1356,11 @@ func main() {
 					Usage:    "assign a name to the storage",
 					Argument: "<name>",
 				},
+				cli.StringFlag{
+					Name:     "repository",
+					Usage:    "initialize a new repository at the specified path rather than the current working directory",
+					Argument: "<path>",
+				},
 			},
 			Usage:     "Initialize the storage if necessary and the current directory as the repository",
 			ArgsUsage: "<snapshot id> <storage url>",
@@ -1326,7 +1400,7 @@ func main() {
 				},
 				cli.BoolFlag{
 					Name:  "vss",
-					Usage: "enable the Volume Shadow Copy service (Windows only)",
+					Usage: "enable the Volume Shadow Copy service (Windows and macOS using APFS only)",
 				},
 				cli.IntFlag{
 					Name:     "vss-timeout",
@@ -1338,6 +1412,10 @@ func main() {
 					Name:     "storage",
 					Usage:    "backup to the specified storage instead of the default one",
 					Argument: "<storage name>",
+				},
+				cli.BoolFlag{
+					Name:  "enum-only",
+					Usage: "enumerate the repository recursively and then exit",
 				},
 			},
 			Usage:     "Save a snapshot of the repository to the storage",
@@ -1629,6 +1707,12 @@ func main() {
 					Usage:    "prune snapshots from the specified storage",
 					Argument: "<storage name>",
 				},
+				cli.IntFlag{
+					Name:     "threads",
+					Value:    1,
+					Usage:    "number of threads used to prune unreferenced chunks",
+					Argument: "<n>",
+				},
 			},
 			Usage:     "Prune snapshots by revision, tag, or retention policy",
 			ArgsUsage: " ",
@@ -1690,6 +1774,11 @@ func main() {
 				cli.BoolFlag{
 					Name:     "bit-identical",
 					Usage:    "(when using -copy) make the new storage bit-identical to also allow rsync etc.",
+				},
+				cli.StringFlag{
+					Name:     "repository",
+					Usage:    "specify the path of the repository (instead of the current working directory)",
+					Argument: "<path>",
 				},
 			},
 			Usage:     "Add an additional storage to be used for the existing repository",
@@ -1820,6 +1909,40 @@ func main() {
 			Usage:     "Show the information about the specified storage",
 			ArgsUsage: "<storage url>",
 			Action:    infoStorage,
+		},
+
+		{
+			Name: "benchmark",
+			Flags: []cli.Flag{
+				cli.IntFlag{
+					Name:     "file-size",
+					Usage:    "the size of the local file to write to and read from (in MB, default to 256)",
+					Argument: "<size>",
+				},
+				cli.IntFlag{
+					Name:     "chunk-count",
+					Usage:    "the number of chunks to upload and download (default to 64)",
+					Argument: "<count>",
+				},
+				cli.IntFlag{
+					Name:     "chunk-size",
+					Usage:    "the size of chunks to upload and download (in MB, default to 4)",
+					Argument: "<size>",
+				},
+				cli.IntFlag{
+					Name:     "upload-threads",
+					Usage:    "the number of upload threads (default to 1)",
+					Argument: "<n>",
+				},
+				cli.IntFlag{
+					Name:     "download-threads",
+					Usage:    "the number of download threads (default to 1)",
+					Argument: "<n>",
+				},
+			},
+			Usage:     "Run a set of benchmarks to test download and upload speeds",
+			ArgsUsage: " ",
+			Action:    benchmark,
 		},
 	}
 
